@@ -40,6 +40,12 @@ Settings exposes **Model loops** with the supported values 1–4 and a default o
 
 You can open Settings or Diagnostics during a turn and return to the same Agent conversation while it is running, waiting for approval, applying settings, or initializing. The transcript, draft, workspace, and approval remain attached to that conversation. Switching to a different Chat or Agent conversation and starting a new conversation can remain unavailable while work is pending.
 
+## Tool calls in the conversation
+
+Agent tool calls appear in the transcript as cards with the tool name, a short argument summary, and a text status. Expand **Arguments** or **Result** to inspect the retained structured arguments and result; the copy buttons copy the complete values. Long results show a UTF-8-safe preview and can be expanded to the full retained text. A separate `[tool output truncated]` label means the tool itself shortened its output.
+
+Statuses distinguish **Pending**, **Processing**, **Waiting for approval**, **Completed**, **Failed**, **Not executed**, and **Outcome unknown**. An approval request is also shown in the existing approval panel. Historical results from version 1 sessions show **Result available** because those transcripts did not record reliable success flags, tool-side truncation, approval decisions, or timing. Repaired interrupted calls show **Outcome unknown**; reopening a card never reruns a tool. Unmatched historical tool results remain visible as notices.
+
 Plain chat uses the legacy `${XDG_DATA_HOME:-~/.local/share}/dory-harness-chat` directory when it exists, otherwise `${XDG_DATA_HOME:-~/.local/share}/rillwright-chat`. If both exist, the app reports the conflict and keeps using the legacy root; close the app before manually consolidating histories. Unreadable storage is reported as an error. Agent transcripts stay in `<workspace>/.dory/sessions/`. Settings prefer `${XDG_CONFIG_HOME:-~/.config}/rillwright/settings.json`, migrate valid legacy settings from `dory-harness/settings.json`, and preserve the original.
 
 ## Permissions and web search

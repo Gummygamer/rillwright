@@ -1,4 +1,5 @@
 mod app;
+mod conversation;
 mod settings;
 mod startup;
 

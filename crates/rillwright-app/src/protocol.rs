@@ -136,12 +136,35 @@ pub enum AppEvent {
         reasoning: bool,
         text: String,
     },
-    Tool {
+    ToolDetected {
         session: SessionId,
         turn: TurnId,
         sequence: u64,
+        call_id: String,
         name: String,
-        status: String,
+        arguments: Map<String, Value>,
+    },
+    ToolResolved {
+        session: SessionId,
+        turn: TurnId,
+        sequence: u64,
+        call_id: Option<String>,
+        name: String,
+        text: String,
+        is_error: bool,
+        truncated: bool,
+    },
+    ToolBound {
+        session: SessionId,
+        turn: TurnId,
+        call_id: String,
+        item_id: String,
+    },
+    AgentNotice {
+        session: SessionId,
+        turn: TurnId,
+        sequence: u64,
+        title: String,
         detail: String,
     },
     Approval {

@@ -1,7 +1,7 @@
 //! Single-owner background worker for model and conversation state.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -1097,6 +1097,9 @@ fn worker(
                 let session_for_events = session.clone();
                 let mut display_messages = messages.clone();
                 let mut event_sequence = 0u64;
+                let mut detected_calls: VecDeque<(String, String)> = VecDeque::new();
+                let mut committed_calls: VecDeque<(String, String)> = VecDeque::new();
+                let mut detection_batch_closed = false;
                 let mut callback = |event: AgentEvent| {
                     if let Err(error) = transcript.record(&event) {
                         turn_cancel.store(true, Ordering::Relaxed);
@@ -1130,37 +1133,88 @@ fn worker(
                             reasoning: true,
                             text,
                         }),
-                        AgentEvent::ToolCall { name, arguments } => Some(AppEvent::Tool {
-                            session: session_for_events.clone(),
-                            turn,
-                            sequence,
-                            name,
-                            status: "running".into(),
-                            detail: serde_json::to_string(&arguments).unwrap_or_default(),
-                        }),
+                        AgentEvent::ToolCall { name, arguments } => {
+                            if detection_batch_closed {
+                                detected_calls.clear();
+                                detection_batch_closed = false;
+                            }
+                            let call_id = format!("{}:{turn}:{sequence}", session_for_events);
+                            detected_calls.push_back((call_id.clone(), name.clone()));
+                            Some(AppEvent::ToolDetected {
+                                session: session_for_events.clone(),
+                                turn,
+                                sequence,
+                                call_id,
+                                name,
+                                arguments,
+                            })
+                        }
                         AgentEvent::ToolResult {
                             name,
                             text,
                             is_error,
                             truncated,
-                        } => Some(AppEvent::Tool {
-                            session: session_for_events.clone(),
-                            turn,
-                            sequence,
-                            name,
-                            status: if is_error { "failed" } else { "completed" }.into(),
-                            detail: if truncated {
-                                format!("{text}\n[output truncated]")
-                            } else {
-                                text
-                            },
-                        }),
-                        AgentEvent::RoundStats(stats) => Some(AppEvent::Stats {
-                            session: session_for_events.clone(),
-                            turn,
-                            stats,
-                        }),
+                        } => {
+                            let call_id = committed_calls
+                                .pop_front()
+                                .filter(|(_, queued_name)| queued_name == &name)
+                                .map(|(id, _)| id);
+                            Some(AppEvent::ToolResolved {
+                                session: session_for_events.clone(),
+                                turn,
+                                sequence,
+                                call_id,
+                                name,
+                                text,
+                                is_error,
+                                truncated,
+                            })
+                        }
+                        AgentEvent::RoundStats(stats) => {
+                            detection_batch_closed = true;
+                            Some(AppEvent::Stats {
+                                session: session_for_events.clone(),
+                                turn,
+                                stats,
+                            })
+                        }
                         AgentEvent::MessageAdded(message) => {
+                            if message.role == "assistant" {
+                                let mut candidates = std::mem::take(&mut detected_calls);
+                                detection_batch_closed = false;
+                                for call in &message.tool_calls {
+                                    if let Some(position) =
+                                        candidates.iter().position(|(_, name)| name == &call.name)
+                                    {
+                                        if let Some(bound) = candidates.remove(position) {
+                                            committed_calls.push_back(bound);
+                                        }
+                                    }
+                                }
+                                // Uncommitted detections are discarded by the agent and never enter the result queue.
+                                let message_position = display_messages.len();
+                                for (ordinal, (call, (call_id, name))) in message
+                                    .tool_calls
+                                    .iter()
+                                    .zip(committed_calls.iter())
+                                    .enumerate()
+                                {
+                                    if name == &call.name {
+                                        let _ = deliver(
+                                            &events,
+                                            &active_cancel,
+                                            AppEvent::ToolBound {
+                                                session: session_for_events.clone(),
+                                                turn,
+                                                call_id: call_id.clone(),
+                                                item_id: format!(
+                                                    "message:{message_position}:call:{ordinal}"
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                             display_messages.push(message);
                             Some(AppEvent::SessionSnapshot {
                                 session: session_for_events.clone(),
@@ -1171,12 +1225,11 @@ fn worker(
                             stage,
                             before,
                             after,
-                        } => Some(AppEvent::Tool {
+                        } => Some(AppEvent::AgentNotice {
                             session: session_for_events.clone(),
                             turn,
                             sequence,
-                            name: "Compaction".into(),
-                            status: "completed".into(),
+                            title: "Context compacted".into(),
                             detail: format!("stage {stage}: {before} → {after} tokens"),
                         }),
                         AgentEvent::Finished(reason) => {
@@ -1187,12 +1240,11 @@ fn worker(
                                 reason: reason.as_str().into(),
                             })
                         }
-                        AgentEvent::MalformedCall(raw) => Some(AppEvent::Tool {
+                        AgentEvent::MalformedCall(raw) => Some(AppEvent::AgentNotice {
                             session: session_for_events.clone(),
                             turn,
                             sequence,
-                            name: "Malformed tool call".into(),
-                            status: "failed".into(),
+                            title: "Malformed tool call".into(),
                             detail: raw,
                         }),
                     };

@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::conversation::{
+    ConversationItem, ToolCallView, ToolState, project_messages, summary as tool_summary,
+};
 use crate::settings::UserSettings;
 use crate::startup::{LaunchOptions, ModelSource, resolve};
 use eframe::egui::{self, Align, Layout, RichText, ScrollArea, TextEdit};
@@ -15,15 +18,9 @@ use rillwright_app::{
 };
 
 #[derive(Clone)]
-struct ChatLine {
-    role: String,
-    body: String,
-}
-
-#[derive(Clone)]
 struct ModeSession {
     id: String,
-    messages: Vec<ChatLine>,
+    messages: Vec<ConversationItem>,
     next_turn: u64,
     transcript_id: String,
     writable: bool,
@@ -81,7 +78,7 @@ pub struct RillwrightApp {
     model_source: ModelSource,
     status: String,
     error: Option<String>,
-    messages: Vec<ChatLine>,
+    messages: Vec<ConversationItem>,
     composer: String,
     running: bool,
     pending_turn_text: Option<(String, u64, String)>,
@@ -268,11 +265,13 @@ impl RillwrightApp {
         if prompt.trim().is_empty() {
             return;
         }
-        self.messages.push(ChatLine {
+        self.messages.push(ConversationItem::Text {
+            id: format!("demo:{}:user", self.demo_phase),
             role: "You".into(),
             body: prompt,
         });
-        self.messages.push(ChatLine {
+        self.messages.push(ConversationItem::Text {
+            id: format!("demo:{}:assistant", self.demo_phase),
             role: "Dory".into(),
             body: String::new(),
         });
@@ -501,6 +500,34 @@ impl RillwrightApp {
                 || self.session_pending
                 || self.pending_settings_revision.is_some(),
         ) != NavigationAction::Block
+    }
+
+    fn approval_answered(&mut self, request: u64) {
+        for item in &mut self.messages {
+            if let Some(tool) = item.tool_mut() {
+                if tool.approval_request == Some(request) {
+                    tool.state = ToolState::Processing;
+                }
+            }
+        }
+    }
+
+    fn terminalize_tool_cards(&mut self) {
+        self.approval = false;
+        self.pending_approval = None;
+        for item in &mut self.messages {
+            if let Some(tool) = item.tool_mut() {
+                if tool.result.is_none() {
+                    tool.state = match tool.state {
+                        ToolState::Pending => ToolState::NotExecuted,
+                        ToolState::Processing | ToolState::WaitingForApproval => {
+                            ToolState::OutcomeUnknown
+                        }
+                        _ => tool.state.clone(),
+                    };
+                }
+            }
+        }
     }
 
     fn reload_block_reason(&self) -> Option<&'static str> {
@@ -762,25 +789,82 @@ impl RillwrightApp {
         }
         match self.demo_phase {
             0 => {
-                self.messages
-                    .last_mut()
-                    .unwrap()
-                    .body
-                    .push_str("I’ll inspect the requested change and run a safe example. ");
+                if let Some(ConversationItem::Text { body, .. }) = self.messages.last_mut() {
+                    body.push_str("I’ll inspect the requested change and run a safe example. ");
+                }
+                self.messages.push(ConversationItem::Tool(ToolCallView {
+                    id: "demo:read".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path":"src/main.rs"})
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    result: Some("fn main() { /* demo only */ }".into()),
+                    state: ToolState::ResultAvailable,
+                    is_error: None,
+                    truncated: Some(false),
+                    approval_request: None,
+                }));
+                self.messages.push(ConversationItem::Tool(ToolCallView {
+                    id: "demo:command".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({"command":"cargo check -p rillwright-gui"})
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    result: None,
+                    state: ToolState::WaitingForApproval,
+                    is_error: None,
+                    truncated: None,
+                    approval_request: None,
+                }));
                 self.demo_phase = 1;
                 self.approval = true;
                 self.status = "Waiting for your approval".into();
                 self.demo_due = None;
             }
             1 => {
-                self.messages.last_mut().unwrap().body.push_str(
-                    "The example action completed successfully. Here is the final scripted answer.",
-                );
+                if let Some(tool) = self
+                    .messages
+                    .iter_mut()
+                    .find_map(ConversationItem::tool_mut)
+                    .filter(|tool| tool.id == "demo:command")
+                {
+                    tool.state = ToolState::Completed;
+                    tool.result = Some("Demo only: command execution was not attempted.".into());
+                }
+                if let Some(ConversationItem::Text { body, .. }) = self.messages.last_mut() {
+                    body.push_str("The example action completed successfully. Here is the final scripted answer.");
+                }
                 self.running = false;
                 self.demo_due = None;
                 self.status = "Demo turn finished".into();
             }
             2 => {
+                let args = serde_json::json!({"path":"same.txt"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                self.messages.push(ConversationItem::Tool(ToolCallView {
+                    id: "demo:failed-read-a".into(),
+                    name: "read_file".into(),
+                    arguments: args.clone(),
+                    result: Some("λ".repeat(3000)),
+                    state: ToolState::Failed,
+                    is_error: Some(true),
+                    truncated: Some(false),
+                    approval_request: None,
+                }));
+                self.messages.push(ConversationItem::Tool(ToolCallView {
+                    id: "demo:unknown-read-b".into(),
+                    name: "read_file".into(),
+                    arguments: args,
+                    result: None,
+                    state: ToolState::OutcomeUnknown,
+                    is_error: None,
+                    truncated: None,
+                    approval_request: None,
+                }));
                 self.running = false;
                 self.demo_due = None;
                 self.error =
@@ -801,7 +885,8 @@ impl RillwrightApp {
                 Ok(event) => event,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if self.model_loading
+                    if self.running
+                        || self.model_loading
                         || self.session_pending
                         || self.pending_settings_revision.is_some()
                     {
@@ -814,6 +899,10 @@ impl RillwrightApp {
                         self.pending_settings_revision = None;
                         self.loaded_loops = None;
                         self.error = Some("The application worker disconnected. Navigation remains available; restart the app to retry.".into());
+                    }
+                    if self.running {
+                        self.running = false;
+                        self.terminalize_tool_cards();
                     }
                     break;
                 }
@@ -857,32 +946,58 @@ impl RillwrightApp {
                     {
                         self.pending_turn_text = None;
                     }
-                    self.messages = messages
-                        .into_iter()
-                        .filter(|m| m.role != "system")
-                        .flat_map(|m| {
-                            let mut rows = Vec::new();
-                            if self.settings.show_reasoning && m.role == "assistant" {
-                                if let Some(reasoning) = m.reasoning_content {
-                                    rows.push(ChatLine {
-                                        role: "Reasoning".into(),
-                                        body: reasoning,
-                                    });
+                    let prior = std::mem::take(&mut self.messages);
+                    let mut projected = project_messages(&messages, self.settings.show_reasoning);
+                    for item in &mut projected {
+                        let Some(tool) = item.tool_mut() else {
+                            continue;
+                        };
+                        let exact = prior
+                            .iter()
+                            .position(|old| old.tool().is_some_and(|t| t.id == tool.id));
+                        if let Some(idx) = exact {
+                            if let Some(previous) = prior[idx].tool() {
+                                if tool.result.is_none() {
+                                    tool.result = previous.result.clone();
+                                }
+                                if previous.is_error.is_some() {
+                                    tool.is_error = previous.is_error;
+                                    tool.truncated = previous.truncated;
+                                }
+                                if previous.result.is_some()
+                                    || matches!(
+                                        previous.state,
+                                        ToolState::NotExecuted
+                                            | ToolState::OutcomeUnknown
+                                            | ToolState::Failed
+                                    )
+                                {
+                                    tool.state = previous.state.clone();
+                                }
+                                tool.approval_request = previous.approval_request;
+                            }
+                        }
+                    }
+                    // Streamed assistant text remains visible until its committed snapshot arrives.
+                    for old in prior {
+                        if let ConversationItem::Text { id, role, body } = &old {
+                            if role == "Dory" {
+                                let committed = projected.iter().any(|item| {
+                                    matches!(item,
+                                    ConversationItem::Text { role: new_role, body: new_body, .. }
+                                    if new_role == "Dory" && new_body.starts_with(body))
+                                });
+                                let same_draft = projected.iter().any(|item| {
+                                    matches!(item,
+                                    ConversationItem::Text { id: new_id, .. } if new_id == id)
+                                });
+                                if !committed && !same_draft {
+                                    projected.push(old);
                                 }
                             }
-                            let role = match m.role.as_str() {
-                                "assistant" => "Dory",
-                                "user" => "You",
-                                "tool" => "Tool result",
-                                _ => "Message",
-                            };
-                            rows.push(ChatLine {
-                                role: role.into(),
-                                body: m.content,
-                            });
-                            rows
-                        })
-                        .collect();
+                        }
+                    }
+                    self.messages = projected;
                 }
                 AppEvent::SessionCreated {
                     session,
@@ -1036,25 +1151,127 @@ impl RillwrightApp {
                         continue;
                     }
                     let role = if reasoning { "Reasoning" } else { "Dory" };
-                    if self.messages.last().is_none_or(|m| m.role != role) {
-                        self.messages.push(ChatLine {
-                            role: role.into(),
-                            body: String::new(),
-                        });
+                    let matches_role = self.messages.last().is_some_and(|item| {
+                        matches!(item,
+                        ConversationItem::Text { role: r, .. } if r == role)
+                            || matches!(item, ConversationItem::Reasoning { .. }) && reasoning
+                    });
+                    if !matches_role {
+                        if reasoning {
+                            self.messages.push(ConversationItem::Reasoning {
+                                id: format!("live:reasoning:{}", self.next_turn),
+                                body: String::new(),
+                            });
+                        } else {
+                            self.messages.push(ConversationItem::Text {
+                                id: format!("live:assistant:{}", self.next_turn),
+                                role: "Dory".into(),
+                                body: String::new(),
+                            });
+                        }
                     }
                     if let Some(last) = self.messages.last_mut() {
-                        last.body.push_str(&text);
+                        match last {
+                            ConversationItem::Text { body, .. }
+                            | ConversationItem::Reasoning { body, .. } => body.push_str(&text),
+                            _ => {}
+                        }
                     }
                 }
-                AppEvent::Tool {
+                AppEvent::ToolDetected {
                     session,
                     turn,
+                    call_id,
                     name,
-                    status,
-                    detail,
+                    arguments,
                     ..
                 } if session == self.session_id && turn + 1 == self.next_turn => {
-                    self.activity.push(format!("{status}: {name} — {detail}"));
+                    self.messages.push(ConversationItem::Tool(ToolCallView {
+                        id: format!("live:{call_id}"),
+                        name,
+                        arguments,
+                        result: None,
+                        state: ToolState::Pending,
+                        is_error: None,
+                        truncated: None,
+                        approval_request: None,
+                    }));
+                }
+                AppEvent::ToolResolved {
+                    session,
+                    turn,
+                    call_id,
+                    name,
+                    text,
+                    is_error,
+                    truncated,
+                    sequence,
+                    ..
+                } if session == self.session_id && turn + 1 == self.next_turn => {
+                    let item = call_id.as_ref().and_then(|id| {
+                        self.messages.iter_mut().find(|item| {
+                            item.tool()
+                                .is_some_and(|tool| tool.id == format!("live:{id}"))
+                        })
+                    });
+                    if let Some(item) = item {
+                        if let Some(tool) = item.tool_mut() {
+                            tool.result = Some(text.clone());
+                            tool.is_error = Some(is_error);
+                            tool.truncated = Some(truncated);
+                            tool.state = if is_error {
+                                ToolState::Failed
+                            } else {
+                                ToolState::Completed
+                            };
+                        }
+                    } else {
+                        self.messages.push(ConversationItem::Notice {
+                            id: format!("live:orphan-result:{sequence}"),
+                            title: format!("Unmatched result: {name}"),
+                            body: text.clone(),
+                        });
+                    }
+                    let shown = if truncated {
+                        format!("{text}\n[output truncated]")
+                    } else {
+                        text
+                    };
+                    self.activity.push(format!(
+                        "{}: {name} — {shown}",
+                        if is_error { "failed" } else { "completed" }
+                    ));
+                }
+                AppEvent::ToolBound {
+                    session,
+                    turn,
+                    call_id,
+                    item_id,
+                } if session == self.session_id && turn + 1 == self.next_turn => {
+                    if let Some(tool) = self
+                        .messages
+                        .iter_mut()
+                        .filter_map(ConversationItem::tool_mut)
+                        .find(|tool| tool.id == format!("live:{call_id}"))
+                    {
+                        tool.id = item_id;
+                    }
+                }
+                AppEvent::AgentNotice {
+                    session,
+                    turn,
+                    title,
+                    detail,
+                    sequence,
+                    ..
+                } if session == self.session_id && turn + 1 == self.next_turn => {
+                    let detail = crate::conversation::bounded(&detail, 4000);
+                    self.messages.push(ConversationItem::Notice {
+                        id: format!("live:notice:{sequence}"),
+                        title: title.clone(),
+                        body: detail.clone(),
+                    });
+                    self.activity.push(format!("{title}: {detail}"));
                 }
                 AppEvent::Stats {
                     session,
@@ -1070,7 +1287,7 @@ impl RillwrightApp {
                     session,
                     turn,
                     request,
-                    tool,
+                    tool: tool_name,
                     summary,
                     risk,
                     workspace,
@@ -1080,8 +1297,17 @@ impl RillwrightApp {
                     sandbox,
                     ..
                 } if session == self.session_id && turn + 1 == self.next_turn => {
+                    if let Some(item) = self.messages.iter_mut().rev().find(|item| {
+                        item.tool()
+                            .is_some_and(|card| card.name == tool_name && card.result.is_none())
+                    }) {
+                        if let Some(card) = item.tool_mut() {
+                            card.state = ToolState::WaitingForApproval;
+                            card.approval_request = Some(request);
+                        }
+                    }
                     self.approval = true;
-                    self.approval_tool = tool.clone();
+                    self.approval_tool = tool_name.clone();
                     self.approval_summary = summary.clone();
                     self.approval_risk = risk;
                     self.approval_workspace = workspace.display().to_string();
@@ -1091,7 +1317,7 @@ impl RillwrightApp {
                     self.approval_command = command.unwrap_or_default();
                     self.approval_sandbox = sandbox.unwrap_or_else(|| "not applicable".into());
                     self.activity
-                        .push(format!("Approval requested for {tool}: {summary}"));
+                        .push(format!("Approval requested for {tool_name}: {summary}"));
                     self.pending_approval = Some(request);
                 }
                 AppEvent::TurnFinished {
@@ -1100,6 +1326,7 @@ impl RillwrightApp {
                     reason,
                 } if session == self.session_id && turn + 1 == self.next_turn => {
                     self.running = false;
+                    self.terminalize_tool_cards();
                     self.status = format!("Turn finished: {reason}");
                     self.runtime_ready = true;
                     if self.deferred_model_load {
@@ -1125,6 +1352,7 @@ impl RillwrightApp {
                     }
                     if session.as_deref() == Some(&self.session_id) && turn.is_some() {
                         self.running = false;
+                        self.terminalize_tool_cards();
                         if let (Some(turn), Some((pending_session, pending_turn, draft))) =
                             (turn, self.pending_turn_text.take())
                         {
@@ -1583,55 +1811,126 @@ impl RillwrightApp {
             .max_height(transcript_height);
         scroll.show(ui, |ui| {
             for idx in 0..self.messages.len() {
-                let line = &mut self.messages[idx];
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&line.role).strong());
-                        if line.role == "Dory" || line.role == "Tool result" {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button("Copy").clicked() {
-                                    ui.ctx().copy_text(line.body.clone());
+                let item = &mut self.messages[idx];
+                match item {
+                    ConversationItem::Tool(tool) => {
+                        ui.push_id(&tool.id, |ui| {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&tool.name).strong());
+                                    ui.label(format!(
+                                        "{} · {}",
+                                        tool_summary(tool),
+                                        tool.state.label()
+                                    ));
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Copy arguments").clicked() {
+                                        ui.ctx().copy_text(
+                                            serde_json::to_string_pretty(&tool.arguments)
+                                                .unwrap_or_default(),
+                                        );
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            tool.result.is_some(),
+                                            egui::Button::new("Copy result"),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(result) = &tool.result {
+                                            ui.ctx().copy_text(result.clone());
+                                        }
+                                    }
+                                });
+                                ui.collapsing("Arguments", |ui| {
+                                    let args = serde_json::to_string_pretty(&tool.arguments)
+                                        .unwrap_or_default();
+                                    ui.add(
+                                        egui::Label::new(RichText::new(args).monospace())
+                                            .wrap()
+                                            .selectable(true),
+                                    );
+                                });
+                                if let Some(result) = &tool.result {
+                                    ui.collapsing("Result", |ui| {
+                                        if result.len() > 4000 {
+                                            ui.small("Preview limited to 4,000 bytes");
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(crate::conversation::bounded(
+                                                    result, 4000,
+                                                ))
+                                                .monospace(),
+                                            )
+                                            .wrap()
+                                            .selectable(true),
+                                        );
+                                        if result.len() > 4000 {
+                                            ui.collapsing("Show full retained output", |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(result).monospace(),
+                                                    )
+                                                    .wrap()
+                                                    .selectable(true),
+                                                );
+                                            });
+                                        }
+                                        if tool.truncated == Some(true) {
+                                            ui.label("[tool output truncated]");
+                                        }
+                                    });
                                 }
                             });
-                        }
-                    });
-                    if line.role == "Reasoning" && !self.settings.show_reasoning {
-                        return;
+                        });
                     }
-                    let code_or_tool = line.role == "Tool result" || line.body.contains("```");
-                    if code_or_tool && line.body.len() > 5000 {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(bounded(&line.body, 4000))
-                                    .size(14.0)
-                                    .monospace(),
-                            )
-                            .wrap()
-                            .selectable(true),
-                        );
-                        ui.collapsing(
-                            format!(
-                                "Show full output ({} characters)",
-                                line.body.chars().count()
-                            ),
-                            |ui| {
+                    ConversationItem::Text { id, role, body } => {
+                        let _ = id;
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&*role).strong());
+                                if role == "Dory" && ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(body.clone());
+                                }
+                            });
+                            let code_or_tool = body.contains("```");
+                            let text = if code_or_tool {
+                                RichText::new(&*body).monospace().size(14.0)
+                            } else {
+                                RichText::new(&*body).size(15.0)
+                            };
+                            ui.add(egui::Label::new(text).wrap().selectable(true));
+                        });
+                    }
+                    ConversationItem::Reasoning { id, body } => {
+                        if self.settings.show_reasoning {
+                            ui.push_id(id.clone(), |ui| {
+                                ui.group(|ui| {
+                                    ui.label(RichText::new("Reasoning").strong());
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&*body).weak())
+                                            .wrap()
+                                            .selectable(true),
+                                    );
+                                });
+                            });
+                        }
+                    }
+                    ConversationItem::Notice { id, title, body } => {
+                        ui.push_id(id.clone(), |ui| {
+                            ui.group(|ui| {
+                                ui.label(RichText::new(&*title).strong());
                                 ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&line.body).size(14.0).monospace(),
-                                    )
-                                    .wrap()
-                                    .selectable(true),
+                                    egui::Label::new(RichText::new(&*body).monospace())
+                                        .wrap()
+                                        .selectable(true),
                                 );
-                            },
-                        );
-                    } else {
-                        let mut text = egui::RichText::new(&line.body).size(15.0);
-                        if code_or_tool {
-                            text = text.monospace().size(14.0);
-                        }
-                        ui.add(egui::Label::new(text).wrap().selectable(true));
+                            });
+                        });
                     }
-                });
+                }
                 ui.add_space(6.0);
             }
         });
@@ -1915,6 +2214,7 @@ impl eframe::App for RillwrightApp {
                                 self.demo_due = Some(Instant::now() + Duration::from_millis(500));
                             } else if let Some(id) = self.pending_approval.take() {
                                 let _ = self.controller.handle.answer_approval(id, Answer::Yes);
+                                self.approval_answered(id);
                             }
                         }
                         if ui
@@ -1924,6 +2224,7 @@ impl eframe::App for RillwrightApp {
                             self.approval = false;
                             if let Some(id) = self.pending_approval.take() {
                                 let _ = self.controller.handle.answer_approval(id, Answer::Always);
+                                self.approval_answered(id);
                             }
                         }
                         if ui.button("Decline").clicked() {
@@ -1938,6 +2239,7 @@ impl eframe::App for RillwrightApp {
                                     Answer::NoWith(self.approval_reason.clone())
                                 };
                                 let _ = self.controller.handle.answer_approval(id, answer);
+                                self.approval_answered(id);
                             }
                         }
                     });
