@@ -41,6 +41,20 @@ pub struct EngineOptions {
     pub prefix_reuse: bool,
     pub swa_full: bool,
     pub flash_attn: crate::model::FlashAttn,
+    /// Record the residual stream at each decode, for [`Engine::probe`].
+    pub capture: bool,
+}
+
+/// One position of a probe: the state after the context so far, and what it predicts next.
+#[derive(Clone, Debug)]
+pub struct ProbeStep {
+    /// The forced token that follows this position (none at the last step) and its logprob.
+    pub forced: Option<(i32, f32, String)>,
+    /// The most likely next tokens: id, logprob, text.
+    pub top: Vec<(i32, f32, String)>,
+    pub n_layers: usize,
+    /// Residual stream of this position after each virtual layer, concatenated.
+    pub hidden: Vec<f32>,
 }
 
 impl EngineOptions {
@@ -56,6 +70,7 @@ impl EngineOptions {
             prefix_reuse: false,
             swa_full: false,
             flash_attn: crate::model::FlashAttn::Auto,
+            capture: false,
         }
     }
 }
@@ -97,7 +112,7 @@ impl Default for GenParams {
             seed: 42,
             temp: 1.0,
             top_p: 0.95,
-            max_tokens: 4096,
+            max_tokens: 8192,
             top_logprobs: 0,
             prefill: PrefillSchedule::default(),
             message_starts: Vec::new(),
@@ -214,6 +229,13 @@ enum Command {
         cancel: Arc<AtomicBool>,
         events: Sender<Result<Event>>,
     },
+    Probe {
+        prompt: Vec<i32>,
+        forced: Vec<i32>,
+        top_k: usize,
+        last_only: bool,
+        reply: Sender<Result<Vec<ProbeStep>>>,
+    },
     SaveSession {
         path: String,
         reply: Sender<Result<usize>>,
@@ -294,6 +316,27 @@ impl Engine {
         self.generate(prompt, params)
     }
 
+    /// Decodes a rendered chat prompt with the usual prefill schedule, then feeds `forced` one
+    /// token at a time. Returns one step per position from the last prompt token on: the residual
+    /// stream there (when the engine was started with `capture`) and the next-token distribution.
+    pub fn probe(
+        &self,
+        prompt: Vec<i32>,
+        forced: Vec<i32>,
+        top_k: usize,
+        last_only: bool,
+    ) -> Result<Vec<ProbeStep>> {
+        let (reply, rx) = mpsc::channel();
+        self.send(Command::Probe {
+            prompt,
+            forced,
+            top_k,
+            last_only,
+            reply,
+        })?;
+        rx.recv().map_err(|_| Error::EngineStopped)?
+    }
+
     /// Runs a generation to completion and returns the text and stats.
     pub fn generate_text(&self, prompt: Vec<i32>, params: GenParams) -> Result<(String, GenStats)> {
         let mut text = String::new();
@@ -363,6 +406,7 @@ fn worker(opts: EngineOptions, rx: Receiver<Command>, ready: Sender<Result<Model
                 n_threads: opts.threads,
                 swa_full: opts.swa_full,
                 flash_attn: opts.flash_attn,
+                capture: opts.capture,
             },
         )?;
         Ok(Worker {
@@ -415,6 +459,18 @@ fn worker(opts: EngineOptions, rx: Receiver<Command>, ready: Sender<Result<Model
                     worker.kv.clear();
                     let _ = events.send(Err(e));
                 }
+            }
+            Command::Probe {
+                prompt,
+                forced,
+                top_k,
+                last_only,
+                reply,
+            } => {
+                let out = worker.probe(&prompt, &forced, top_k, last_only);
+                worker.ctx.clear_kv();
+                worker.kv.clear();
+                let _ = reply.send(out);
             }
             Command::SaveSession { path, reply } => {
                 let _ = reply.send(worker.save_session(&path));
@@ -577,6 +633,69 @@ impl Worker {
         };
         let _ = events.send(Ok(Event::Done(stats)));
         Ok(())
+    }
+
+    fn probe(
+        &mut self,
+        prompt: &[i32],
+        forced: &[i32],
+        top_k: usize,
+        last_only: bool,
+    ) -> Result<Vec<ProbeStep>> {
+        if prompt.is_empty() {
+            return Err(Error::EmptyPrompt);
+        }
+        let n_ctx = self.ctx.n_ctx() as usize;
+        if prompt.len() + forced.len() >= n_ctx {
+            return Err(Error::PromptTooLong {
+                prompt: prompt.len() + forced.len(),
+                n_ctx: n_ctx as u32,
+            });
+        }
+        self.ctx.clear_kv();
+        self.kv.clear();
+        let starts = prefill::message_starts(prompt, &tokenize_model(
+            self.ctx.model(),
+            chat::USER_TURN,
+            false,
+            true,
+        )?);
+        let chunks = prefill::chunk_sizes(
+            PrefillSchedule::default(),
+            0,
+            prompt.len(),
+            self.opts.n_batch as usize,
+            self.opts.n_ubatch as usize,
+            &starts,
+        );
+        let mut at = 0;
+        for &size in &chunks {
+            self.ctx.decode(&prompt[at..at + size])?;
+            at += size;
+        }
+        let text = |w: &Worker, t: i32| String::from_utf8_lossy(&w.piece(t)).into_owned();
+        let mut steps = Vec::with_capacity(forced.len() + 1);
+        for i in 0..=forced.len() {
+            let next = forced.get(i).copied();
+            let (lp, top) = token_probs(self.ctx.last_logits(), next.unwrap_or(0), top_k);
+            let (mut n_layers, mut hidden) = self.ctx.captured();
+            if last_only && n_layers > 1 {
+                // Keep only the final layer: the state the output weights read.
+                let width = hidden.len() / n_layers;
+                hidden.drain(..hidden.len() - width);
+                n_layers = 1;
+            }
+            steps.push(ProbeStep {
+                forced: next.map(|t| (t, lp, text(self, t))),
+                top: top.into_iter().map(|(t, l)| (t, l, text(self, t))).collect(),
+                n_layers,
+                hidden,
+            });
+            if let Some(t) = next {
+                self.ctx.decode(&[t])?;
+            }
+        }
+        Ok(steps)
     }
 
     fn piece(&self, token: i32) -> Vec<u8> {

@@ -70,7 +70,7 @@ impl Default for UserSettings {
             seed: 42,
             temperature: 1.0,
             top_p: 0.95,
-            max_tokens: 4096,
+            max_tokens: 8192,
             thinking: true,
             max_rounds: 30,
             max_seconds: 1800,

@@ -83,7 +83,7 @@ struct GenArgs {
     temp: f32,
     #[arg(long, global = true, default_value_t = 0.95)]
     top_p: f32,
-    #[arg(long, global = true, default_value_t = 4096)]
+    #[arg(long, global = true, default_value_t = 8192)]
     max_tokens: u32,
     /// Render the prompt with thinking off.
     #[arg(long, global = true)]
@@ -157,6 +157,24 @@ enum Cmd {
         #[arg(long)]
         chat_turn: bool,
     },
+    /// Read the model's internal state. Each case file is {prompt} (rendered text, as written by
+    /// RILLWRIGHT_DUMP_ROUNDS) or {messages, tools?, enable_thinking?}, plus an optional `forced`
+    /// continuation that is fed token by token. For every position from the last prompt token on,
+    /// writes the next-token logprobs to NAME.json and the residual stream after each layer to
+    /// NAME.f32 (float32, shape [steps, layers, width]) in --out-dir.
+    Probe {
+        cases: Vec<PathBuf>,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        /// Skip the residual stream and write only the logprobs.
+        #[arg(long)]
+        no_hidden: bool,
+        /// Keep only the final layer of the residual stream (the state the output weights read).
+        #[arg(long)]
+        last_layer: bool,
+    },
     /// Run the agent: the model reads and changes files and runs commands in a project folder,
     /// under permission rules. Give a task, or leave it out for an interactive session.
     Agent(agent_cmd::AgentArgs),
@@ -192,6 +210,13 @@ fn main() -> Result<()> {
         Cmd::Run { prompt, system } => run(&cli, prompt, system.as_deref()),
         Cmd::Chat { system } => chat_repl(&cli, system.as_deref()),
         Cmd::Raw { case, chat_turn } => raw(&cli, case, *chat_turn),
+        Cmd::Probe {
+            cases,
+            out_dir,
+            top,
+            no_hidden,
+            last_layer,
+        } => probe(&cli, cases, out_dir, *top, *no_hidden, *last_layer),
         Cmd::Bench {
             prompt_tokens,
             gen_tokens,
@@ -539,6 +564,85 @@ fn merge_pieces(pieces: Vec<Piece>) -> Vec<Piece> {
         }
     }
     out
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeCase {
+    prompt: Option<String>,
+    #[serde(default)]
+    messages: Vec<Message>,
+    #[serde(default)]
+    tools: Vec<ToolDef>,
+    enable_thinking: Option<bool>,
+    #[serde(default)]
+    forced: String,
+}
+
+fn probe(
+    cli: &Cli,
+    cases: &[PathBuf],
+    out_dir: &PathBuf,
+    top: usize,
+    no_hidden: bool,
+    last_layer: bool,
+) -> Result<()> {
+    use std::io::Write;
+    let mut opts = engine_options(&cli.load, false)?;
+    opts.capture = !no_hidden;
+    let engine = Engine::start(opts).context("starting the engine")?;
+    chat::check_template(&engine.info.chat_template.clone().unwrap_or_default())?;
+    std::fs::create_dir_all(out_dir)?;
+    for path in cases {
+        let case: ProbeCase = serde_json::from_str(&std::fs::read_to_string(path)?)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let prompt = match &case.prompt {
+            Some(p) => p.clone(),
+            None => chat::render(
+                &case.messages,
+                &case.tools,
+                case.enable_thinking.unwrap_or(!cli.gen_args.no_think),
+            )?,
+        };
+        let tokens = engine.tokenize(&prompt, false, true)?;
+        let forced = if case.forced.is_empty() {
+            Vec::new()
+        } else {
+            engine.tokenize(&case.forced, false, true)?
+        };
+        let steps = engine.probe(tokens.clone(), forced, top, last_layer)?;
+        let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        let n_layers = steps.first().map(|s| s.n_layers).unwrap_or(0);
+        let width = steps
+            .first()
+            .map(|s| if s.n_layers > 0 { s.hidden.len() / s.n_layers } else { 0 })
+            .unwrap_or(0);
+        let json = serde_json::json!({
+            "prompt_tokens": tokens.len(),
+            "steps": steps.len(),
+            "layers": n_layers,
+            "width": width,
+            "loops": cli.load.loops,
+            "forced": steps.iter().map(|s| match &s.forced {
+                Some((id, lp, text)) => serde_json::json!([id, lp, text]),
+                None => serde_json::Value::Null,
+            }).collect::<Vec<_>>(),
+            "top": steps.iter().map(|s| s.top.iter()
+                .map(|(id, lp, text)| serde_json::json!([id, lp, text])).collect::<Vec<_>>()
+            ).collect::<Vec<_>>(),
+        });
+        std::fs::write(out_dir.join(format!("{name}.json")), json.to_string())?;
+        if !no_hidden {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(out_dir.join(format!("{name}.f32")))?);
+            for s in &steps {
+                for v in &s.hidden {
+                    f.write_all(&v.to_le_bytes())?;
+                }
+            }
+            f.flush()?;
+        }
+        eprintln!("{name}: {} prompt tokens, {} steps, {n_layers} layers", tokens.len(), steps.len());
+    }
+    Ok(())
 }
 
 fn raw(cli: &Cli, case_path: &PathBuf, chat_turn: bool) -> Result<()> {

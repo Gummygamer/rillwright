@@ -50,6 +50,10 @@ impl Backend for EngineBackend<'_> {
         on_event: &mut dyn FnMut(Event),
     ) -> Result<GenStats> {
         let tokens = self.engine.tokenize(prompt, false, true)?;
+        // RILLWRIGHT_DUMP_ROUNDS=DIR writes each round's exact prompt and raw output there, so a
+        // round can be replayed with `rillwright probe`.
+        let dump_dir = std::env::var_os("RILLWRIGHT_DUMP_ROUNDS").filter(|d| !d.is_empty());
+        let mut dump = dump_dir.as_ref().map(|_| String::new());
         let generation = self.engine.generate_chat(tokens, params.clone())?;
         let handle = generation.cancel_handle();
         let finished = AtomicBool::new(false);
@@ -70,7 +74,12 @@ impl Backend for EngineBackend<'_> {
             for ev in generation {
                 match ev {
                     Ok(Event::Done(s)) => stats = Some(s),
-                    Ok(other) => on_event(other),
+                    Ok(other) => {
+                        if let (Some(out), Event::Text(t)) = (dump.as_mut(), &other) {
+                            out.push_str(t);
+                        }
+                        on_event(other)
+                    }
                     Err(e) => {
                         failure = Some(e);
                         break;
@@ -79,6 +88,13 @@ impl Backend for EngineBackend<'_> {
             }
             finished.store(true, Ordering::Relaxed);
         });
+        if let (Some(dir), Some(output)) = (dump_dir, dump) {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+            let body = serde_json::json!({ "prompt": prompt, "output": output });
+            let _ = std::fs::write(dir.join(format!("r{n:03}.json")), body.to_string());
+        }
         if let Some(e) = failure {
             return Err(e);
         }

@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(generation.params.seed, 42);
         assert_eq!(generation.params.temp, 1.0);
         assert_eq!(generation.params.top_p, 0.95);
-        assert_eq!(generation.params.max_tokens, 4096);
+        assert_eq!(generation.params.max_tokens, 8192);
         let agent = AgentSettings::default();
         assert_eq!(agent.permission.as_str(), "ask");
         assert_eq!(agent.max_rounds, 30);

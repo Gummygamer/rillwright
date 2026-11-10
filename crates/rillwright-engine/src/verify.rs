@@ -13,13 +13,26 @@ pub const PINNED_MODEL_SHA256: &str =
 /// The llama.cpp PR #30306 head that the Dory runtime was tested against.
 pub const PINNED_FORK_COMMIT: &str = "1c3cdd23787750814aa21a070dc4d6dc451af871";
 
-/// Streams the file through SHA-256 and compares it with the pin.
+/// Names the SHA-256 of a model that is deliberately not the pinned file, such as a copy with edited
+/// weights (see `wsp/`). The file must still match the value given, so a typo or a stale path fails.
+pub const MODEL_SHA256_OVERRIDE_ENV: &str = "RILLWRIGHT_MODEL_SHA256";
+
+/// The checksum the model file must have: the pin, unless the override variable names another.
+pub fn expected_model_sha256() -> String {
+    match std::env::var(MODEL_SHA256_OVERRIDE_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_ascii_lowercase(),
+        _ => PINNED_MODEL_SHA256.to_string(),
+    }
+}
+
+/// Streams the file through SHA-256 and compares it with the expected checksum.
 pub fn verify_model(path: &Path) -> Result<()> {
     let actual = sha256_file(path)?;
-    if actual != PINNED_MODEL_SHA256 {
+    let expected = expected_model_sha256();
+    if actual != expected {
         return Err(Error::Checksum {
             path: path.to_path_buf(),
-            expected: PINNED_MODEL_SHA256.to_string(),
+            expected,
             actual,
         });
     }
