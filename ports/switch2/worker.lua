@@ -1,0 +1,10 @@
+require("love")
+require("love.thread")
+local prompt = ...
+local ok, result = pcall(function()
+    local model = require("ns2text")
+    assert(model.ready(), "Dory model missing from switch/gen1recomp/models")
+    assert(model.open())
+    return assert(model.generate({prompt = prompt, max_tokens = 384}))
+end)
+love.thread.getChannel("reply"):push({ok = ok, text = tostring(result)})
