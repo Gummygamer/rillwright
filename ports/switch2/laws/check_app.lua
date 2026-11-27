@@ -17,7 +17,12 @@ end
 function os.rename(a,b) a,b=a:sub(7),b:sub(7);data[b],data[a]=assert(data[a]),nil;return true end
 local reply,prompt
 function love.thread.newThread() return {start=function(_,s) prompt=s end,getError=function()end} end
-function love.thread.getChannel() return {pop=function() local r=reply;reply=nil;return r end} end
+local pieces={}
+local channels={
+ reply={pop=function() local r=reply;reply=nil;return r end},
+ stream={pop=function() return table.remove(pieces,1) end,clear=function() pieces={} end}
+}
+function love.thread.getChannel(name) return channels[name] end
 local function output(s) reply={ok=true,text=s};love.update() end
 dofile("ports/switch2/main.lua")
 love.load()
@@ -84,4 +89,29 @@ assert(restored[1].trace==":" and restored[2].user==binary and restored[2].answe
 local path="sessions/"..fixture..".chat"
 data[path]=data[path]:sub(1,-2)
 assert(not pcall(store.load,fixture))
+-- Streamed pieces render as reasoning, a partial tool call, then the reply.
+local ui=require("ui")
+local captured
+ui.draw=function(state) captured=state.live; return state.scroll,state.approvalScroll end
+local function stream(...) for _,p in ipairs({...}) do pieces[#pieces+1]=p end; love.update(); love.draw() end
+local function blocks() local a={} for _,b in ipairs(captured.blocks) do a[#a+1]=b.label.."="..b.text end return table.concat(a,"|") end
+key("b") -- close the session picker
+send("What is in hello.txt?")
+assert(prompt:sub(-30)=="<|im_start|>assistant\n<think>\n")
+stream("I should ","read it.")
+assert(blocks()=="THINKING …=I should read it.")
+stream("</think>\n<tool_call><function=read_file><parameter=path>hel")
+assert(blocks()=="THINKING=I should read it.|TOOL CALL …=read_file\npath: hel")
+stream("\xC3")
+assert(blocks():sub(-3)=="hel", "partial UTF-8 is held back")
+stream(false, "Retried")
+assert(blocks()=="THINKING …=Retried")
+output("I should read it.</think>\n<tool_call><function=read_file><parameter=path>hello.txt</parameter></function></tool_call>")
+love.draw()
+assert(blocks()=="THINKING=I should read it.|TOOL CALL=read_file\npath: hello.txt|TOOL RESULT=Hi")
+stream("Done.</think>It says ","Hi.")
+assert(blocks():find("|DORY …=It says Hi.",1,true))
+output("Done.</think>It says Hi.")
+love.draw()
+assert(captured==nil and store.load(data["sessions/current"])[1].answer=="It says Hi.")
 print("Rillwright Lua behavior checks passed")

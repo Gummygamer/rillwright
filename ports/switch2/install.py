@@ -20,8 +20,8 @@ with model.open("rb") as stream:
     if stream.read(8) != b"GGUF\x03\0\0\0":
         raise SystemExit(f"Expected a GGUF v3 model at {model}")
 nro = bytearray((runtime / "gen1recomp.nro").read_bytes())
-if hashlib.sha256(nro).hexdigest() != "af4dab69ccc46f98491a9737f8222833de00517a55d90ce84e94142346194504":
-    raise SystemExit("Expected the Switch 2 Dory runtime with CPU marker support")
+if hashlib.sha256(nro).hexdigest() != "c866c2ba8e5107aac8634837298d79dcbd90fbe847f6796b877c9e9432f55c09":
+    raise SystemExit("Expected the Switch 2 Dory runtime that detects the integrated Switch 2 GPU")
 
 # Keep executable segments intact and replace the launcher's icon and title.
 base = struct.unpack_from("<I", nro, 24)[0]
@@ -42,7 +42,7 @@ destination.mkdir(exist_ok=True)
 with TemporaryDirectory(dir=destination) as temporary:
     stage = Path(temporary)
     with zipfile.ZipFile(stage / "game.love", "w", zipfile.ZIP_DEFLATED) as archive:
-        for name in ("conf.lua", "main.lua", "worker.lua", "tools.lua", "storage.lua"):
+        for name in ("conf.lua", "main.lua", "ui.lua", "worker.lua", "tools.lua", "storage.lua"):
             archive.write(source / name, name)
     (stage / "rillwright.nro").write_bytes(nro)
     for name in ("game.love", "rillwright.nro"):
